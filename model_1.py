@@ -424,11 +424,13 @@ class RBFFeatureInterpolator(nn.Module):
 
         # 3. 计算高斯权重
         # 使用 softplus 保证 sigma 始终大于 0
-        sigma_safe = F.softplus(self.sigma) + 1e-5
+        # sigma_safe = F.softplus(self.sigma) + 1e-5
+        sigma_safe = F.softplus(self.sigma) + 1e-2
         weights = torch.exp(- (topk_dists ** 2) / (2 * sigma_safe ** 2))
 
         # 归一化权重 (防止全0除)
-        weights_sum = torch.sum(weights, dim=2, keepdim=True) + 1e-8
+        # weights_sum = torch.sum(weights, dim=2, keepdim=True) + 1e-8
+        weights_sum = torch.sum(weights, dim=2, keepdim=True) + 1e-5
         norm_weights = weights / weights_sum  # (B, N_q, k)
 
         # 4. Gather 特征

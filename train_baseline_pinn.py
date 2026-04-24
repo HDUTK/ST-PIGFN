@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.8.10
 # -*- coding: utf-8 -*-
 """
-function description: 此文件用于标准的 PINN 实现，没有任何图网络结构，
+function description: 此文件用于标准的 PINN 实现，没有任何图网络结构，(需要遮蔽20%进行对比)
 只用 MLP 拟合坐标和时间。运行这个文件得到纯 PINN 在测试集上的精度，用于和上面的结果做对比
 Baseline: Standard Pure PINN (无时空图结构)
 用于对比实验：证明 ST-PIGFN 优于纯 PINN
@@ -13,6 +13,7 @@ version: V1.0
 """
 
 
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -46,8 +47,8 @@ class PurePINN(nn.Module):
 def train_and_evaluate_pinn():
     # ================= 配置区域 =================
     GROTTO_ID = 10  # 确认石窟ID
-    EPOCHS = 2000  # 训练轮数
-    LR = 0.001  # 学习率
+    EPOCHS = 5000  # 训练轮数
+    LR = 0.0005  # 学习率
     DATA_PATH = './data'
     COORDS_PATH = './data/_sensor_coords.csv'
     # ===========================================
@@ -69,10 +70,16 @@ def train_and_evaluate_pinn():
 
     print(f"Found {len(sensor_ids)} sensors for Grotto {GROTTO_ID}.")
 
+    # 加载 main.py 生成的测试名单
+    with open('./results_slices_FULL_Z_10_Masked/test_sensors.json', 'r') as f:
+        test_sensor_ids = json.load(f)
+
     # --- B. 加载传感器时序数据 ---
     dfs = []
     print("Loading sensor CSVs...")
     for sid in sensor_ids:
+        if sid in test_sensor_ids:
+            continue
         f = os.path.join(DATA_PATH, f"{sid}.csv")
         if os.path.exists(f):
             # 只读时间和温度
@@ -130,7 +137,7 @@ def train_and_evaluate_pinn():
 
     # [采样] 为了演示和速度，从训练池中随机采样 N 个点
     # 如果显卡够强，可以适当增加 n
-    train_df = train_pool.sample(n=50000, random_state=42)
+    train_df = train_pool.sample(n=300000, random_state=42)
     # 测试集不采样，或者采样大一点
     test_df = test_pool
 
@@ -229,6 +236,9 @@ def train_and_evaluate_pinn():
     print(f"🔹 Pure PINN MAE  : {mae:.4f}")
     print(f"🔹 Pure PINN R²   : {r2:.4f}")
     print("=" * 40)
+
+    torch.save(model.state_dict(), 'pure_inr_checkpoint.pth')
+    print("✅ Pure INR 模型权重已保存至 ./pure_inr_masked_checkpoint.pth")
 
 
 if __name__ == '__main__':

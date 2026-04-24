@@ -41,6 +41,8 @@ grotto_temperature_project/
 
 # main.py
 import os
+import json
+import random
 import torch
 import pandas as pd
 import numpy as np
@@ -299,8 +301,8 @@ if __name__ == '__main__':
     # 🔥 Z轴惩罚系数批量测试开关 (Parameter Sensitivity Test) 🔥
     # Z轴高程惩罚系数，用于构建各向异性图拓扑 (推荐范围: 5.0 ~ 20.0)
     # ==============================================================
-    RUN_Z_PENALTY_TEST = True  # 专门为3.6节跑数据时设为 True，平时不用设为 False
-    Z_PENALTY_LIST = [1.0, 5.0, 15.0, 20.0]  # 要测试的 Z 轴惩罚系数列表 (10.0 已经跑过可不加)
+    RUN_Z_PENALTY_TEST = False  # 专门为3.6节跑数据时设为 True，平时不用设为 False
+    Z_PENALTY_LIST = [1.0, 5.0, 10.0, 15.0, 20.0]  # 要测试的 Z 轴惩罚系数列表 (10.0 已经跑过可不加)
 
     # 如果开启批量测试，就遍历列表；否则就只跑一个默认的 [10.0]
     test_z_values = Z_PENALTY_LIST if RUN_Z_PENALTY_TEST else [10.0]
@@ -316,7 +318,12 @@ if __name__ == '__main__':
         # 'FULL'          : 完整的 ST-PIGFN (带 PDE, 带 BC, 带动态 Q)
         # 'DATA_DRIVEN'   : 纯数据驱动 (强制关闭 PDE 和 BC)
         # 'STATIC_SOURCE' : 静态源 PINN (保留 PDE 和 BC, 但强制 Q=0)
-        ABLATION_MODE = 'FULL'
+        ABLATION_MODE = 'STATIC_SOURCE'
+
+        # ======== 👇 空间遮蔽测试开关 👇 ========
+        ENABLE_SPATIAL_MASKING = True  # 设置为 True 时，隔离 20% 节点用于对比 IDW/Kriging；为 False 时，使用 100% 节点训练
+        MASK_RATIO = 0.2  # 遮蔽比例
+        # ===============================================
 
         # 动态匹配模型参数与存储文件夹
         if ABLATION_MODE == 'FULL':
@@ -341,6 +348,15 @@ if __name__ == '__main__':
             SAVE_DIR = './results_slices_STATIC_SOURCE'
         else:
             raise ValueError("未知的消融实验模式！")
+
+        # ==========================================================
+        # ======== 👇 根据遮蔽开关动态追加文件夹后缀 👇 ========
+        # ==========================================================
+        if ENABLE_SPATIAL_MASKING:
+            # 加上 _Masked 后缀
+            # 例如：results_slices_FULL 会变成 results_slices_FULL_Masked
+            SAVE_DIR = f"{SAVE_DIR}_Masked"
+        # ==========================================================
 
         # --- 1. 参数配置 --- (必须是全大写的否则不能写入config.txt)
         DATA_PATH = './data'
@@ -397,7 +413,8 @@ if __name__ == '__main__':
                 'ABLATION_MODE': ABLATION_MODE, 'LAMBDA_PDE': LAMBDA_PDE, 'LAMBDA_BC': LAMBDA_BC,
                 'USE_Q_NET': USE_Q_NET, 'Z_PENALTY': Z_PENALTY, 'SEQ_LEN': SEQ_LEN, 'PRE_LEN': PRE_LEN,
                 'BATCH_SIZE': BATCH_SIZE, 'EPOCHS': EPOCHS, 'LAMBDA_RECON': LAMBDA_RECON,
-                'TAU_RELAXATION': TAU_RELAXATION, 'K_ADJ': K_ADJ, 'INPUT_DIM': INPUT_DIM
+                'TAU_RELAXATION': TAU_RELAXATION, 'K_ADJ': K_ADJ, 'INPUT_DIM': INPUT_DIM,
+                'ENABLE_SPATIAL_MASKING': ENABLE_SPATIAL_MASKING, 'MASK_RATIO': MASK_RATIO  # <-- 新增
             }
             for key, value in config_dict.items():
                 f.write(f"{key} = {value}\n")
@@ -405,11 +422,66 @@ if __name__ == '__main__':
         print(f"✅ 当前运行配置已自动归档至: {config_file_path}")
         # ======================== 👆 结束 👆 ========================
 
+        # --- 1.5 处理空间物理隔离 (向下兼容逻辑) ---
+        actual_coords_path = COORDS_PATH  # 默认使用全量传感器坐标文件
+
+        if ENABLE_SPATIAL_MASKING:
+            print(f"\n[⚠️ 开启空间物理隔离] 随机遮蔽 {MASK_RATIO * 100}% 的传感器用于纯空间插值测试...")
+
+            RANDOM_SEED = 42
+            random.seed(RANDOM_SEED)
+            np.random.seed(RANDOM_SEED)
+
+            # 读取全部传感器
+            all_coords_df = pd.read_csv(COORDS_PATH)
+            # 筛选出当前石窟的所有数据
+            grotto_sensors_df = all_coords_df[all_coords_df['grottoe_id'] == TARGET_GROTTO_ID]
+
+            test_sensor_ids = []
+
+            # 🌟 按区域 (zone_id) 进行分层抽样 (Stratified Sampling) 🌟
+            for zone_id, group in grotto_sensors_df.groupby('zone_id'):
+                zone_sensors = group['sensor_id'].unique().tolist()
+                # 计算该区域需要遮蔽的数量 (至少保留1个，防止某区域传感器太少被抹零)
+                num_test_zone = max(1, int(len(zone_sensors) * MASK_RATIO))
+
+                # 在该区域内随机抽取
+                sampled_for_zone = random.sample(zone_sensors, num_test_zone)
+                test_sensor_ids.extend(sampled_for_zone)
+
+                print(f"  - 区域 {zone_id} 共有 {len(zone_sensors)} 个传感器，遮蔽了 {num_test_zone} 个用于测试。")
+
+            # 剩下的全部作为训练集
+            grotto_sensors_all = grotto_sensors_df['sensor_id'].unique().tolist()
+            train_sensor_ids = [s for s in grotto_sensors_all if s not in test_sensor_ids]
+
+            # 保存测试名单供 compare_interpolation.py 读取
+            if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
+            with open(os.path.join(SAVE_DIR, 'test_sensors.json'), 'w') as f:
+                json.dump(test_sensor_ids, f)
+
+            print(f"✅ 传感器拆分完成：训练使用 {len(train_sensor_ids)} 个，测试预留 {len(test_sensor_ids)} 个")
+
+            # 生成一个临时只包含 80% 传感器的 CSV 文件
+            temp_coords_path = os.path.join(SAVE_DIR, 'temp_train_coords.csv')
+            all_coords_df[all_coords_df['sensor_id'].isin(train_sensor_ids)].to_csv(temp_coords_path, index=False)
+
+            # 告诉后续的数据加载器去读这个“残缺版”的文件
+            actual_coords_path = temp_coords_path
+
+        else:
+            print("\n[ℹ️ 使用全量传感器] 模型将看到所有 100% 的节点 (标准预测模式)...")
+            # 如果不开启遮蔽，建议生成一个空的 test_sensors.json 避免后续代码报错
+            if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
+            with open(os.path.join(SAVE_DIR, 'test_sensors.json'), 'w') as f:
+                json.dump([], f)
+
         # --- 2. 加载和预处理数据 ---
         dataset, adj_matrix, temp_scaler, coords_df, coords_scaler, temp_min, temp_max = \
             load_and_preprocess_data(
                 DATA_PATH,
-                COORDS_PATH,
+                actual_coords_path,
+                # COORDS_PATH,
                 target_grotto_id=TARGET_GROTTO_ID,  # 传入目标ID
                 seq_len=SEQ_LEN,
                 pre_len=PRE_LEN,
