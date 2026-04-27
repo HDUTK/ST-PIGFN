@@ -71,7 +71,7 @@ def train_and_evaluate_pinn():
     print(f"Found {len(sensor_ids)} sensors for Grotto {GROTTO_ID}.")
 
     # 加载 main.py 生成的测试名单
-    with open('./results_slices_FULL_Z_10_Masked/test_sensors.json', 'r') as f:
+    with open('./results_slices_FULL_Masked/test_sensors.json', 'r') as f:
         test_sensor_ids = json.load(f)
 
     # --- B. 加载传感器时序数据 ---
@@ -162,15 +162,49 @@ def train_and_evaluate_pinn():
     optimizer = optim.Adam(model.parameters(), lr=LR)
     criterion = nn.MSELoss()
 
-    print("Start Training Pure PINN...")
+    # ==========================================
+    # 🌟 核心开关：切换 Pure INR 和 Standard PINN
+    # ==========================================
+    USE_PDE = True  # 设为 False 跑 Pure INR，设为 True 跑 Standard PINN
+    ALPHA = 0.05  # 热扩散系数
+    model_name = "Standard PINN" if USE_PDE else "Pure INR"
+    save_name = 'standard_pinn_checkpoint.pth' if USE_PDE else 'pure_inr_checkpoint.pth'
+
+    print(f"Start Training {model_name}...")
+
     for epoch in range(EPOCHS):
         model.train()
         optimizer.zero_grad()
 
+        # 开启梯度追踪 (针对 Standard PINN)
+        x_train.requires_grad_(True)
+        y_train.requires_grad_(True)
+        z_train.requires_grad_(True)
+        t_train.requires_grad_(True)
+
         pred = model(x_train, y_train, z_train, t_train)
-        loss = criterion(pred, temp_train)
+        loss_data = criterion(pred, temp_train)
+
+        if USE_PDE:
+            # Standard PINN 物理残差计算
+            grads = torch.autograd.grad(outputs=pred, inputs=[x_train, y_train, z_train, t_train],
+                                        grad_outputs=torch.ones_like(pred), create_graph=True)
+            dT_dx, dT_dy, dT_dz, dT_dt = grads[0], grads[1], grads[2], grads[3]
+
+            d2T_dx2 = torch.autograd.grad(dT_dx, x_train, torch.ones_like(dT_dx), create_graph=True)[0]
+            d2T_dy2 = torch.autograd.grad(dT_dy, y_train, torch.ones_like(dT_dy), create_graph=True)[0]
+            d2T_dz2 = torch.autograd.grad(dT_dz, z_train, torch.ones_like(dT_dz), create_graph=True)[0]
+
+            laplacian = d2T_dx2 + d2T_dy2 + d2T_dz2
+            pde_residual = dT_dt - ALPHA * laplacian
+            loss_pde = torch.mean(pde_residual ** 2)
+
+            loss = loss_data + 0.1 * loss_pde  # 混合 Loss
+        else:
+            loss = loss_data
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 加个防爆盾
         optimizer.step()
 
         if (epoch + 1) % 200 == 0:
@@ -237,8 +271,8 @@ def train_and_evaluate_pinn():
     print(f"🔹 Pure PINN R²   : {r2:.4f}")
     print("=" * 40)
 
-    torch.save(model.state_dict(), 'pure_inr_checkpoint.pth')
-    print("✅ Pure INR 模型权重已保存至 ./pure_inr_masked_checkpoint.pth")
+    torch.save(model.state_dict(), f'./{save_name}')
+    print(f"✅ {model_name} 权重已保存至 ./{save_name}")
 
 
 if __name__ == '__main__':

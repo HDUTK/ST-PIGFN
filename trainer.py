@@ -131,7 +131,9 @@ def train(model, train_loader, pre_adj, coords_df_normalized,
           epochs=10, lr=0.0005, lambda_pde=0.1,
           lambda_bc=0.5,   # 接收BC权重
           lambda_recon=1.0,  # 解码器重构损失权重
-          tau=5.0, val_loader=None, test_loader=None, device=None):
+          tau=5.0, val_loader=None, test_loader=None, device=None,
+          ablation_mode='FULL', test_indices=[],
+          enable_spatial_masking=False):
     """
     Minimal-change training loop that also evaluates on val_loader per epoch.
     - val_loader and test_loader are optional DataLoader objects (created in main.py).
@@ -210,127 +212,158 @@ def train(model, train_loader, pre_adj, coords_df_normalized,
             # 使用 autocast 上下文
             with autocast(**amp_args):
 
-                # 运行 GWN (我们需要 features 来进行插值)
-                # model.gwn 返回 (y_pred, features)
-                y_pred_gwn, sensor_features = model.gwn(x_batch, pre_adj_t)
+                # ========================================================
+                # 🚀 模式分流：图时空补全 (3.2节) vs 连续物理桥接/消融 (3.5节)
+                # 只有当同时满足 "DATA_DRIVEN" 且 "开启了物理隔离掩码" 时，才执行强制抹零和图补全
+                # ========================================================
+                if ablation_mode == 'DATA_DRIVEN' and enable_spatial_masking:
+                    # 1. 强行抹零 (Masking): 把测试集的输入历史特征变成 0
+                    x_batch_masked = x_batch.clone()
+                    if len(test_indices) > 0:
+                        x_batch_masked[:, 0, test_indices, :] = 0.0
 
-                # Data Loss
-                loss_data = masked_mse_loss(y_pred_gwn, y_batch, mask_batch)
+                        # 2. 运行原生的 Graph WaveNet，跳过后续所有 RBF 和 PINN！
+                    # （新版返回元组 y_pred, features）
+                    y_pred_gwn, _ = model.gwn(x_batch_masked, pre_adj_t)
 
-                # --- Loss B: Decoder 重构损失 (监督 Decoder) ---
-                # 目的：强制 Decoder 在传感器位置的输出 = 真实温度
-                # 取预测窗口的第1个时间步 (t=0) 进行对齐
-                B, N, _ = y_batch.shape
+                    # 3. 计算 Loss: 只让网络学习训练集节点，测试集节点全靠图传播盲猜
+                    mask_batch_train = mask_batch.clone()
+                    if len(test_indices) > 0:
+                        mask_batch_train[:, test_indices, :] = 0.0  # 剥夺测试节点的 Loss
 
-                # 构造输入:
-                # Coords: (B, N, 3) -> 传感器位置
-                batch_sensor_coords = model.sensor_coords.unsqueeze(0).expand(B, -1, -1)
-                # Time: (B, N, 1) -> t=0.0 (代表当前/下一时刻)
-                batch_t_zero = torch.zeros((B, N, 1), device=device)
+                    loss_data = masked_mse_loss(y_pred_gwn, y_batch, mask_batch_train)
+                    loss = loss_data
 
-                # RBF 插值 (虽然是在传感器原位插值，但经过RBF平滑是必要的)
-                interp_feats_sensors = model.interpolator(batch_sensor_coords, model.sensor_coords, sensor_features)
+                    # 为了日志不报错，将其他 Loss 置零
+                    loss_recon, loss_pde, loss_bc = torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
 
-                # Decoder 预测
-                decoder_input_sensors = torch.cat([batch_sensor_coords, batch_t_zero, interp_feats_sensors], dim=-1)
-                pred_sensor_temp = model.decoder(decoder_input_sensors).squeeze(-1)  # (B, N)
+                else:
+                    # =======================================================
+                    # 🚀 FULL (Ours) 核心逻辑：120 节点特征提取 -> RBF -> PINN解码
+                    # 包含: 100%节点的 DATA_DRIVEN (权重0), STATIC_SOURCE (Q=0), FULL
+                    # =======================================================
 
-                # 目标: y_batch 的第1个时间步
-                target_sensor_temp = y_batch[:, :, 0]  # (B, N)
-                mask_sensor = mask_batch[:, :, 0]  # (B, N)
+                    # 运行 GWN (我们需要 features 来进行插值)
+                    # model.gwn 返回 (y_pred, features)
+                    y_pred_gwn, sensor_features = model.gwn(x_batch, pre_adj_t)
 
-                loss_recon = masked_mse_loss(pred_sensor_temp, target_sensor_temp, mask_sensor)
-                # ----------------------------------------------------
+                    # Data Loss
+                    loss_data = masked_mse_loss(y_pred_gwn, y_batch, mask_batch)
 
-                # sample PDE collocation points if your model requires; keep same logic as before
-                num_pde_points = 512
-                coords_arr = np.asarray(coords_df_normalized)
-                min_bounds = torch.tensor(coords_arr.min(axis=0), dtype=torch.float32, device=device)
-                max_bounds = torch.tensor(coords_arr.max(axis=0), dtype=torch.float32, device=device)
-                pde_coords = torch.rand(num_pde_points, 3, device=device) * (max_bounds - min_bounds) + min_bounds
-                pde_t = torch.rand(num_pde_points, 1, device=device)
-                pde_coords_t = torch.cat([pde_coords, pde_t], dim=1).to(device)  # (Np, 4) or (B, Np, 4)
+                    # --- Loss B: Decoder 重构损失 (监督 Decoder) ---
+                    # 目的：强制 Decoder 在传感器位置的输出 = 真实温度
+                    # 取预测窗口的第1个时间步 (t=0) 进行对齐
+                    B, N, _ = y_batch.shape
 
-                # 调用 model forward 计算残差 (SpatiotemporalPINN 内部会处理 PDE 导数)
-                # 注意：forward 内部也会跑一次 gwn
-                # 如果追求极致性能，可以修改 forward 接收外部传入的 features
-                # (自动扩展 pde_coords_t batch 维)
-                _, pde_residual = model(x_batch, pre_adj_t, pde_coords_t,
-                                        sensor_features_precalc=sensor_features)
+                    # 构造输入:
+                    # Coords: (B, N, 3) -> 传感器位置
+                    batch_sensor_coords = model.sensor_coords.unsqueeze(0).expand(B, -1, -1)
+                    # Time: (B, N, 1) -> t=0.0 (代表当前/下一时刻)
+                    batch_t_zero = torch.zeros((B, N, 1), device=device)
 
-                # ================= 空间自适应物理松弛 =================
-                # 1. 拼接输入历史和预测目标，寻找局部时间窗口内的最大突变
-                # x_batch shape: (B, 4, N, Seq) -> 索引 0 是温度特征
-                history_temp = x_batch[:, 0, :, :]  # (B, N, Seq_len)
-                full_temp_seq = torch.cat([history_temp, y_batch], dim=2)  # (B, N, Seq_len + Pre_len)
+                    # RBF 插值 (虽然是在传感器原位插值，但经过RBF平滑是必要的)
+                    interp_feats_sensors = model.interpolator(batch_sensor_coords, model.sensor_coords, sensor_features)
 
-                # 2. 计算相邻时间步的温差绝对值
-                temporal_diff = torch.abs(full_temp_seq[:, :, 1:] - full_temp_seq[:, :, :-1])
-                max_jump_per_node, _ = torch.max(temporal_diff, dim=2)  # (B, N)
+                    # Decoder 预测
+                    decoder_input_sensors = torch.cat([batch_sensor_coords, batch_t_zero, interp_feats_sensors], dim=-1)
+                    pred_sensor_temp = model.decoder(decoder_input_sensors).squeeze(-1)  # (B, N)
 
-                # 3. 计算节点级松弛权重 (指数衰减)
-                # 因为温度已经归一化到 0~1，0.7 的剧烈降温在 tau=5.0 下权重会掉到 0.03 (几乎取消物理约束)
-                # 0.05 的正常波动在 tau=5.0 下权重保持在 0.77 (物理约束依然强力)
-                # tau = 5.0
-                node_relaxation = torch.exp(-tau * max_jump_per_node).unsqueeze(-1).detach()  # (B, N, 1)
+                    # 目标: y_batch 的第1个时间步
+                    target_sensor_temp = y_batch[:, :, 0]  # (B, N)
+                    mask_sensor = mask_batch[:, :, 0]  # (B, N)
 
-                # 4. 利用 RBF 插值器，将传感器上的松弛权重，映射到 PDE 点上
-                # pde_coords_t 在 trainer.py 是 2D (N_pde, 4)，先扩展为 3D (B, N_pde, 4)
-                batch_pde_coords = pde_coords_t.unsqueeze(0).expand(B, -1, -1)
-                pde_xyz = batch_pde_coords[:, :, :3]  # 现在可以安全地切片了，(B, N_pde, 3)
-                pde_relaxation = model.interpolator(pde_xyz, model.sensor_coords, node_relaxation)  # (B, N_pde, 1)
+                    loss_recon = masked_mse_loss(pred_sensor_temp, target_sensor_temp, mask_sensor)
+                    # ----------------------------------------------------
 
-                # 5. 对 PDE 物理残差进行加权并求均值
-                # 原本 pde_residual 是 (B * N_pde, 1)，reshape 回 (B, N_pde, 1)
-                pde_residual = pde_residual.view(B, num_pde_points, 1)
-                # weighted_pde_residual = pde_residual * pde_relaxation
-                # loss_pde = torch.mean(weighted_pde_residual ** 2)  # PDE Loss 通常不需要 mask，因为是虚拟点
+                    # sample PDE collocation points if your model requires; keep same logic as before
+                    num_pde_points = 512
+                    coords_arr = np.asarray(coords_df_normalized)
+                    min_bounds = torch.tensor(coords_arr.min(axis=0), dtype=torch.float32, device=device)
+                    max_bounds = torch.tensor(coords_arr.max(axis=0), dtype=torch.float32, device=device)
+                    pde_coords = torch.rand(num_pde_points, 3, device=device) * (max_bounds - min_bounds) + min_bounds
+                    pde_t = torch.rand(num_pde_points, 1, device=device)
+                    pde_coords_t = torch.cat([pde_coords, pde_t], dim=1).to(device)  # (Np, 4) or (B, Np, 4)
 
-                # ============== 、使用鲁棒的 Smooth L1 Loss ==============
-                weighted_pde_residual = pde_residual * pde_relaxation
-                # 用 smooth_l1_loss 替代平方误差
-                target_zeros = torch.zeros_like(weighted_pde_residual)
-                loss_pde = F.smooth_l1_loss(weighted_pde_residual, target_zeros)
+                    # 调用 model forward 计算残差 (SpatiotemporalPINN 内部会处理 PDE 导数)
+                    # 注意：forward 内部也会跑一次 gwn
+                    # 如果追求极致性能，可以修改 forward 接收外部传入的 features
+                    # (自动扩展 pde_coords_t batch 维)
+                    _, pde_residual = model(x_batch, pre_adj_t, pde_coords_t,
+                                            sensor_features_precalc=sensor_features)
 
-                # ====================================================================
+                    # ================= 空间自适应物理松弛 =================
+                    # 1. 拼接输入历史和预测目标，寻找局部时间窗口内的最大突变
+                    # x_batch shape: (B, 4, N, Seq) -> 索引 0 是温度特征
+                    history_temp = x_batch[:, 0, :, :]  # (B, N, Seq_len)
+                    full_temp_seq = torch.cat([history_temp, y_batch], dim=2)  # (B, N, Seq_len + Pre_len)
 
-                # loss_pde = torch.mean(pde_residual ** 2)  # PDE Loss 通常不需要 mask，因为是虚拟点
+                    # 2. 计算相邻时间步的温差绝对值
+                    temporal_diff = torch.abs(full_temp_seq[:, :, 1:] - full_temp_seq[:, :, :-1])
+                    max_jump_per_node, _ = torch.max(temporal_diff, dim=2)  # (B, N)
 
-                # BC Loss (边界条件)
-                loss_bc = torch.tensor(0.0, device=device)
-                if boundary_coords is not None:
-                    B = x_batch.size(0)
-                    N_bound = boundary_coords.size(0)
+                    # 3. 计算节点级松弛权重 (指数衰减)
+                    # 因为温度已经归一化到 0~1，0.7 的剧烈降温在 tau=5.0 下权重会掉到 0.03 (几乎取消物理约束)
+                    # 0.05 的正常波动在 tau=5.0 下权重保持在 0.77 (物理约束依然强力)
+                    # tau = 5.0
+                    node_relaxation = torch.exp(-tau * max_jump_per_node).unsqueeze(-1).detach()  # (B, N, 1)
 
-                    # A. 构造边界输入
-                    # 坐标扩展到 Batch: (B, N_b, 3)
-                    batch_bound_coords = boundary_coords.unsqueeze(0).expand(B, -1, -1)
+                    # 4. 利用 RBF 插值器，将传感器上的松弛权重，映射到 PDE 点上
+                    # pde_coords_t 在 trainer.py 是 2D (N_pde, 4)，先扩展为 3D (B, N_pde, 4)
+                    batch_pde_coords = pde_coords_t.unsqueeze(0).expand(B, -1, -1)
+                    pde_xyz = batch_pde_coords[:, :, :3]  # 现在可以安全地切片了，(B, N_pde, 3)
+                    pde_relaxation = model.interpolator(pde_xyz, model.sensor_coords, node_relaxation)  # (B, N_pde, 1)
 
-                    # 时间: 假设约束的是 output 时刻 (归一化时间 1.0)
-                    batch_t = torch.ones((B, N_bound, 1), device=device)
+                    # 5. 对 PDE 物理残差进行加权并求均值
+                    # 原本 pde_residual 是 (B * N_pde, 1)，reshape 回 (B, N_pde, 1)
+                    pde_residual = pde_residual.view(B, num_pde_points, 1)
+                    # weighted_pde_residual = pde_residual * pde_relaxation
+                    # loss_pde = torch.mean(weighted_pde_residual ** 2)  # PDE Loss 通常不需要 mask，因为是虚拟点
 
-                    # B. 插值特征 (从 GWN 提取的 sensor_features 插值到 boundary_coords)
-                    # input: (B, N_b, 3), (N_s, 3), (B, N_s, 32) -> (B, N_b, 32)
-                    interp_feats_bc = model.interpolator(batch_bound_coords, model.sensor_coords, sensor_features)
+                    # ============== 、使用鲁棒的 Smooth L1 Loss ==============
+                    weighted_pde_residual = pde_residual * pde_relaxation
+                    # 用 smooth_l1_loss 替代平方误差
+                    target_zeros = torch.zeros_like(weighted_pde_residual)
+                    loss_pde = F.smooth_l1_loss(weighted_pde_residual, target_zeros)
 
-                    # C. Decoder 预测
-                    # input: [x, y, z, t, features]
-                    decoder_input_bc = torch.cat([batch_bound_coords, batch_t, interp_feats_bc], dim=-1)
-                    pred_bc_temp = model.decoder(decoder_input_bc).squeeze(-1)  # (B, N_b)
+                    # ====================================================================
 
-                    # D. 计算 MSE: 预测值 vs 外界气温
-                    # ambient_batch (B, 1) -> expand to (B, N_b)
-                    target_bc = ambient_batch.expand(-1, N_bound)
+                    # loss_pde = torch.mean(pde_residual ** 2)  # PDE Loss 通常不需要 mask，因为是虚拟点
 
-                    # --- 对边界损失也进行插值松弛 ---
-                    bc_relaxation = model.interpolator(batch_bound_coords, model.sensor_coords,
-                                                       node_relaxation).squeeze(-1)  # (B, N_b)
-                    unreduced_loss_bc = (pred_bc_temp - target_bc) ** 2
-                    loss_bc = torch.mean(unreduced_loss_bc * bc_relaxation)
-                    # loss_bc = torch.mean((pred_bc_temp - target_bc) ** 2)
+                    # BC Loss (边界条件)
+                    loss_bc = torch.tensor(0.0, device=device)
+                    if boundary_coords is not None:
+                        B = x_batch.size(0)
+                        N_bound = boundary_coords.size(0)
 
-                # 数据误差 + pde误差 + BC边界条件误差
-                loss = loss_data + lambda_recon * loss_recon + lambda_pde * loss_pde + lambda_bc * loss_bc
+                        # A. 构造边界输入
+                        # 坐标扩展到 Batch: (B, N_b, 3)
+                        batch_bound_coords = boundary_coords.unsqueeze(0).expand(B, -1, -1)
+
+                        # 时间: 假设约束的是 output 时刻 (归一化时间 1.0)
+                        batch_t = torch.ones((B, N_bound, 1), device=device)
+
+                        # B. 插值特征 (从 GWN 提取的 sensor_features 插值到 boundary_coords)
+                        # input: (B, N_b, 3), (N_s, 3), (B, N_s, 32) -> (B, N_b, 32)
+                        interp_feats_bc = model.interpolator(batch_bound_coords, model.sensor_coords, sensor_features)
+
+                        # C. Decoder 预测
+                        # input: [x, y, z, t, features]
+                        decoder_input_bc = torch.cat([batch_bound_coords, batch_t, interp_feats_bc], dim=-1)
+                        pred_bc_temp = model.decoder(decoder_input_bc).squeeze(-1)  # (B, N_b)
+
+                        # D. 计算 MSE: 预测值 vs 外界气温
+                        # ambient_batch (B, 1) -> expand to (B, N_b)
+                        target_bc = ambient_batch.expand(-1, N_bound)
+
+                        # --- 对边界损失也进行插值松弛 ---
+                        bc_relaxation = model.interpolator(batch_bound_coords, model.sensor_coords,
+                                                           node_relaxation).squeeze(-1)  # (B, N_b)
+                        unreduced_loss_bc = (pred_bc_temp - target_bc) ** 2
+                        loss_bc = torch.mean(unreduced_loss_bc * bc_relaxation)
+                        # loss_bc = torch.mean((pred_bc_temp - target_bc) ** 2)
+
+                    # 数据误差 + pde误差 + BC边界条件误差
+                    loss = loss_data + lambda_recon * loss_recon + lambda_pde * loss_pde + lambda_bc * loss_bc
 
             # NaN 检测与跳过
             if torch.isnan(loss):
